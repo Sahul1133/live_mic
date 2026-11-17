@@ -52,7 +52,6 @@
   .label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
   #transcript { width: 100%; min-height: 110px; resize: vertical; border: none; background: transparent; padding: 0; font-size: 16px; line-height: 1.5; }
   #transcript:focus { outline: none; }
-  #interim { color: var(--muted); font-style: italic; font-size: 15px; min-height: 20px; }
   .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
 
   #answers .qa { border-top: 1px solid var(--border); padding: 14px 0; }
@@ -83,9 +82,7 @@
     <div class="settings">
       <input id="apiKey" type="password" placeholder="Paste Gemini API key" />
       <select id="model">
-        <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
-        <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+        <option value="gemini-3.8-flash">gemini-3.8-flash</option>
       </select>
       <select id="lang">
         <option value="en-US">English (US)</option>
@@ -109,7 +106,6 @@
       <button id="clearBtn" class="btn-ghost">Clear</button>
     </div>
     <textarea id="transcript" placeholder="Your speech will appear here live… (you can also type or edit)"></textarea>
-    <div id="interim"></div>
     <div class="actions">
       <button id="sendBtn" class="btn-primary">Send ➤</button>
     </div>
@@ -130,9 +126,36 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch {} }
   };
   $('apiKey').value = store.get('gemini_key') || '';
-  $('model').value = store.get('gemini_model') || 'gemini-2.5-flash';
+  const DEFAULT_MODEL = 'gemini-3.8-flash';
+  let savedModel = store.get('gemini_model');
+  if (!savedModel || /^gemini-(1|2)\./.test(savedModel)) savedModel = DEFAULT_MODEL; // old models retired
+  $('model').value = savedModel;
   $('lang').value = store.get('speech_lang') || 'en-US';
-  $('apiKey').addEventListener('change', e => store.set('gemini_key', e.target.value.trim()));
+  $('apiKey').addEventListener('change', e => { store.set('gemini_key', e.target.value.trim()); loadModels(); });
+
+  // Fetch the models your key can actually use, so retired models never break the app
+  async function loadModels() {
+    const key = $('apiKey').value.trim();
+    if (!key) return;
+    try {
+      const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': key } });
+      if (!res.ok) return;
+      const data = await res.json();
+      const names = (data.models || [])
+        .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+        .map(m => m.name.replace('models/', ''))
+        .filter(n => n.startsWith('gemini') && !/embed|tts|image|audio|live|vision|robotics|computer/i.test(n))
+        .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+      if (!names.length) return;
+      const sel = $('model');
+      const current = sel.value;
+      sel.innerHTML = names.map(n => `<option value="${n}">${n}</option>`).join('');
+      sel.value = names.includes(current) ? current
+        : (names.find(n => /flash$/.test(n) && !/lite/.test(n)) || names.find(n => /flash/.test(n)) || names[0]);
+      store.set('gemini_model', sel.value);
+    } catch {}
+  }
+  loadModels();
   $('model').addEventListener('change', e => store.set('gemini_model', e.target.value));
   $('lang').addEventListener('change', e => {
     store.set('speech_lang', e.target.value);
@@ -141,6 +164,15 @@
 
   // ---------- Speech recognition (continuous + live) ----------
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let committed = '';       // settled words
+  let currentInterim = '';  // words still being recognized (shown live)
+  function renderTranscript() {
+    const t = $('transcript');
+    t.value = (committed + (currentInterim ? ' ' + currentInterim : '')).trim();
+    t.scrollTop = t.scrollHeight;
+  }
+  // if you type/edit in the box, keep your edits
+  $('transcript').addEventListener('input', () => { committed = $('transcript').value; currentInterim = ''; });
   let recognition = null;
   let listening = false;
 
@@ -158,16 +190,16 @@
     recognition.onresult = (event) => {
       let interim = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const text = event.results[i][0].transcript;
+        const text = event.results[i][0].transcript.trim();
+        if (!text) continue;
         if (event.results[i].isFinal) {
-          const t = $('transcript');
-          t.value = (t.value + ' ' + text.trim()).trim();
-          t.scrollTop = t.scrollHeight;
+          committed = (committed + ' ' + text).trim();
         } else {
-          interim += text;
+          interim += ' ' + text;
         }
       }
-      $('interim').textContent = interim;
+      currentInterim = interim.trim();
+      renderTranscript();
     };
 
     recognition.onerror = (e) => {
@@ -182,7 +214,8 @@
 
     // Chrome stops after silence / ~60s — restart automatically so it's truly continuous
     recognition.onend = () => {
-      $('interim').textContent = '';
+      // keep any half-finished words instead of losing them on restart
+      if (currentInterim) { committed = (committed + ' ' + currentInterim).trim(); currentInterim = ''; renderTranscript(); }
       if (listening) {
         setTimeout(() => { try { recognition.lang = $('lang').value; recognition.start(); } catch {} }, 150);
       }
@@ -206,7 +239,7 @@
     setMicUI();
   });
 
-  $('clearBtn').addEventListener('click', () => { $('transcript').value = ''; $('interim').textContent = ''; });
+  $('clearBtn').addEventListener('click', () => { committed = ''; currentInterim = ''; renderTranscript(); });
 
   // ---------- Gemini ----------
   const SYSTEM_PROMPT = `You are answering questions as a confident, knowledgeable candidate in a conversation (like an interview or a viva).
@@ -249,12 +282,11 @@ Rules:
 
   async function send() {
     // include any words still being recognized
-    const question = ($('transcript').value + ' ' + $('interim').textContent).trim();
+    const question = $('transcript').value.trim();
     if (!question) { $('status').textContent = 'Nothing to send yet — say something first.'; return; }
 
     // clear transcript right away so the next question starts fresh (mic keeps running)
-    $('transcript').value = '';
-    $('interim').textContent = '';
+    committed = ''; currentInterim = ''; renderTranscript();
 
     const answers = $('answers');
     if (answers.querySelector('.q') && !answers.querySelector('.qa')) answers.innerHTML = '';
@@ -270,6 +302,9 @@ Rules:
       aEl.classList.remove('loading');
     } catch (err) {
       aEl.textContent = '⚠️ ' + err.message;
+      if (/no longer available|not found|not supported/i.test(err.message)) {
+        loadModels(); aEl.textContent += '\n\n↻ Model list refreshed — tap Send again.';
+      }
       aEl.classList.remove('loading');
       aEl.classList.add('err');
     }
